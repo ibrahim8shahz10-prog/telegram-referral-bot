@@ -111,6 +111,9 @@ function forceJoinKeyboard(channels) {
   return { inline_keyboard: buttons };
 }
 
+// ─── PENDING REFERRERS (in memory) ────────────
+const pendingReferrers = {};
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(200).send('Bot is running ✅');
@@ -126,11 +129,30 @@ module.exports = async function handler(req, res) {
       const chatId = cb.message.chat.id;
       const messageId = cb.message.message_id;
       const firstName = cb.from.first_name || 'User';
+      const username = cb.from.username || '';
 
       await answerCallback(cb.id, '⏳ Checking...');
 
       if (cb.data === 'verify') {
         const channels = await getChannels();
+
+        if (channels.length === 0) {
+          const existing = await getUser(userId);
+          if (!existing) {
+            await supabase.from('users').insert({
+              telegram_id: userId,
+              username,
+              first_name: firstName,
+              points: 0,
+              referrer_id: null,
+            });
+          }
+          await editMessage(chatId, messageId, `✅ <b>Welcome ${firstName}!</b>\n\nYou now have full access!`, null);
+          const menuKb = await mainMenuKeyboard();
+          await sendMessage(chatId, `🏠 <b>Main Menu</b>`, menuKb);
+          return res.status(200).json({ ok: true });
+        }
+
         const results = await Promise.all(
           channels.map(c => checkMembership(userId, c.channel_username))
         );
@@ -139,20 +161,27 @@ module.exports = async function handler(req, res) {
         if (notJoined.length > 0) {
           const names = notJoined.map(c => `❌ ${c.channel_name}`).join('\n');
           await editMessage(chatId, messageId,
-            `⚠️ <b>Not joined yet!</b>\n\nStill need to join:\n${names}\n\nJoin and press Verify again.`,
+            `⚠️ <b>Not joined yet!</b>\n\nStill need:\n${names}\n\nJoin and press Verify again.`,
             forceJoinKeyboard(channels)
           );
         } else {
-          // Save user to database
           const existing = await getUser(userId);
           if (!existing) {
+            const referrerId = pendingReferrers[userId] || null;
             await supabase.from('users').insert({
               telegram_id: userId,
-              username: cb.from.username || '',
+              username,
               first_name: firstName,
               points: 0,
               referrer_id: null,
             });
+            if (referrerId) {
+              await supabase.rpc('increment_points', {
+                user_telegram_id: referrerId,
+                amount: 10,
+              });
+              delete pendingReferrers[userId];
+            }
           }
 
           await editMessage(chatId, messageId,
@@ -184,26 +213,29 @@ module.exports = async function handler(req, res) {
     if (text.startsWith('/start')) {
       const parts = text.split(' ');
       const referrerId = (parts[1] && parts[1] !== userId) ? parts[1] : null;
+
       const existingUser = await getUser(userId);
 
       if (existingUser) {
-        // User exists = already verified, show menu
         const menuKb = await mainMenuKeyboard();
         await sendMessage(chatId,
           `👋 <b>Welcome back, ${firstName}!</b>\n\n💰 Points: <b>${existingUser.points}</b>\n\nChoose an option:`,
           menuKb
         );
       } else {
-        // New user — show force join
+        if (referrerId) {
+          pendingReferrers[userId] = referrerId;
+        }
+
         const channels = await getChannels();
+
         if (channels.length === 0) {
-          // No channels — register directly
           await supabase.from('users').insert({
             telegram_id: userId,
             username,
             first_name: firstName,
             points: 0,
-            referrer_id: referrerId,
+            referrer_id: null,
           });
           const menuKb = await mainMenuKeyboard();
           await sendMessage(chatId,
@@ -211,17 +243,8 @@ module.exports = async function handler(req, res) {
             menuKb
           );
         } else {
-          // Save referrer temporarily
-          await supabase.from('users').upsert({
-            telegram_id: userId,
-            username,
-            first_name: firstName,
-            points: 0,
-            referrer_id: referrerId,
-          }, { onConflict: 'telegram_id' });
-
           await sendMessage(chatId,
-            `👋 <b>Welcome to the bot, ${firstName}!</b>\n\n🔒 Please join all our channels below first.\n\nAfter joining press ✅ <b>Verify</b>.`,
+            `👋 <b>Welcome to the bot, ${firstName}!</b>\n\n🔒 Please join all channels below first.\n\nAfter joining press ✅ <b>Verify</b>.`,
             forceJoinKeyboard(channels)
           );
         }
@@ -234,10 +257,7 @@ module.exports = async function handler(req, res) {
       if (!isAdmin) {
         await sendMessage(chatId, `❌ Not authorized.`);
       } else {
-        await sendMessage(chatId,
-          `🔐 <b>Admin Panel</b>\n\nWelcome Admin!`,
-          adminMenuKeyboard()
-        );
+        await sendMessage(chatId, `🔐 <b>Admin Panel</b>\n\nWelcome Admin!`, adminMenuKeyboard());
       }
       return res.status(200).json({ ok: true });
     }
@@ -351,7 +371,7 @@ module.exports = async function handler(req, res) {
 
       if (text === '📢 Add Channel') {
         await sendMessage(chatId,
-          `📢 <b>Add Channel</b>\n\nFormat:\n<code>/addchannel username | Name | link</code>\n\nExample:\n<code>/addchannel mychannel | My Channel | https://t.me/mychannel</code>`,
+          `📢 <b>Add Channel</b>\n\nFormat:\n<code>/addchannel username | Name | link</code>`,
           adminMenuKeyboard());
         return res.status(200).json({ ok: true });
       }
@@ -429,8 +449,10 @@ module.exports = async function handler(req, res) {
     const userData = await getUser(userId);
 
     if (!userData) {
+      const channels = await getChannels();
       await sendMessage(chatId,
-        `⚠️ Please send /start first to register.`
+        `⚠️ Please send /start first to register.`,
+        channels.length > 0 ? forceJoinKeyboard(channels) : null
       );
       return res.status(200).json({ ok: true });
     }
@@ -439,15 +461,18 @@ module.exports = async function handler(req, res) {
       await sendMessage(chatId,
         `💰 <b>Your Balance</b>\n\nYou have <b>${userData.points} points</b>.`,
         await mainMenuKeyboard());
+
     } else if (text === '/referral' || text === '🔗 Referral Link') {
       const link = `https://t.me/${BOT_USERNAME}?start=${userId}`;
       await sendMessage(chatId,
         `🔗 <b>Your Referral Link</b>\n\n<code>${link}</code>\n\n✅ Earn <b>10 points</b> per new user!`,
         await mainMenuKeyboard());
+
     } else if (text === '/redeem' || text === '🎁 Redeem Code') {
       await sendMessage(chatId,
         `🎁 Send: <code>/code YOURCODE</code>`,
         await mainMenuKeyboard());
+
     } else if (text.startsWith('/code ')) {
       const code = text.replace('/code ', '').trim().toUpperCase();
       const { data: codeData } = await supabase.from('redeem_codes').select('*').eq('code', code).single();
@@ -468,12 +493,13 @@ module.exports = async function handler(req, res) {
             await mainMenuKeyboard());
         }
       }
+
     } else if (text === '/help' || text === '📋 Commands') {
       await sendMessage(chatId,
         `📋 <b>Commands</b>\n\n/start — Start bot\n/points — Check balance\n/referral — Get referral link\n/code CODE — Redeem a code\n/help — This menu`,
         await mainMenuKeyboard());
+
     } else {
-      // Check panel buttons
       const panels = await getPanels();
       const matchedPanel = panels.find(p => text.startsWith(p.name));
 
@@ -506,4 +532,4 @@ module.exports = async function handler(req, res) {
     console.error('Webhook error:', err.message);
     return res.status(200).json({ ok: true });
   }
-      }
+    }
