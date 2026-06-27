@@ -78,8 +78,8 @@ async function mainMenuKeyboard() {
   const panels = await getPanels();
   const rows = [];
   for (let i = 0; i < panels.length; i += 2) {
-    const row = [{ text: `${panels[i].name} (${panels[i].price} pts)` }];
-    if (panels[i + 1]) row.push({ text: `${panels[i + 1].name} (${panels[i + 1].price} pts)` });
+    const row = [{ text: `${panels[i].name}` }];
+    if (panels[i + 1]) row.push({ text: `${panels[i + 1].name}` });
     rows.push(row);
   }
   rows.push([{ text: '💰 My Points' }, { text: '🔗 Referral Link' }]);
@@ -135,14 +135,17 @@ module.exports = async function handler(req, res) {
 
       if (cb.data === 'verify') {
         const channels = await getChannels();
+        const referrerId = pendingReferrers[userId] || null;
+        const existingUser = await getUser(userId);
+        const initialPoints = existingUser ? existingUser.points : 0;
 
         if (channels.length === 0) {
           await supabase.from('users').upsert({
             telegram_id: userId,
             username,
             first_name: firstName,
-            points: 0,
-            referrer_id: null,
+            points: initialPoints,
+            referrer_id: referrerId,
           }, { onConflict: 'telegram_id' });
 
           await editMessage(chatId, messageId,
@@ -164,19 +167,17 @@ module.exports = async function handler(req, res) {
             forceJoinKeyboard(channels)
           );
         } else {
-          const referrerId = pendingReferrers[userId] || null;
-
           const { error: upsertError } = await supabase.from('users').upsert({
             telegram_id: userId,
             username,
             first_name: firstName,
-            points: 0,
-            referrer_id: null,
+            points: initialPoints,
+            referrer_id: referrerId,
           }, { onConflict: 'telegram_id' });
 
           if (upsertError) console.error('upsert error:', upsertError.message);
 
-          if (referrerId) {
+          if (referrerId && !existingUser) {
             await supabase.rpc('increment_points', {
               user_telegram_id: referrerId,
               amount: 10,
@@ -232,7 +233,7 @@ module.exports = async function handler(req, res) {
             username,
             first_name: firstName,
             points: 0,
-            referrer_id: null,
+            referrer_id: referrerId,
           }, { onConflict: 'telegram_id' });
 
           if (error) console.error('insert error:', error.message);
@@ -357,10 +358,13 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // BUG FIX HERE: Improved error logging and selection tracking
       if (text === '📋 List Codes') {
-        const { data: codes } = await supabase.from('redeem_codes').select('*');
+        const { data: codes, error: codeErr } = await supabase.from('redeem_codes').select('*');
+        if (codeErr) console.error('List Codes database error:', codeErr.message);
+
         if (!codes || codes.length === 0) {
-          await sendMessage(chatId, `No codes found.`, adminMenuKeyboard());
+          await sendMessage(chatId, `No codes found in database matching selection.`, adminMenuKeyboard());
         } else {
           let list = `📋 <b>All Codes</b>\n\n`;
           codes.forEach(c => { list += `🎟 <b>${c.code}</b> — ${c.points} pts | ${c.used_count}/${c.max_uses}\n`; });
@@ -457,12 +461,28 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    if (text === '/points' || text === '💰 My Points') {
+    if (text === '/daily' || text === '🎁 Daily Reward') {
+      const now = new Date();
+      const lastClaim = userData.last_daily_claim ? new Date(userData.last_daily_claim) : null;
+
+      if (lastClaim && (now - lastClaim) < 24 * 60 * 60 * 1000) {
+        const nextClaimTime = new Date(lastClaim.getTime() + 24 * 60 * 60 * 1000);
+        const hoursLeft = Math.ceil((nextClaimTime - now) / (1000 * 60 * 60));
+        await sendMessage(chatId, `❌ You already claimed your daily reward. Try again in <b>${hoursLeft} hours</b>.`, await mainMenuKeyboard());
+      } else {
+        await supabase.rpc('increment_points', { user_telegram_id: userId, amount: 1 });
+        await supabase.from('users').update({ last_daily_claim: now.toISOString() }).eq('telegram_id', userId);
+        await sendMessage(chatId, `🎁 <b>Daily Reward Claimed!</b>\n\n+1 Point added to your profile balance.`, await mainMenuKeyboard());
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    if (text === '/points' || text === '💰 My Points' || text === '/balance') {
       await sendMessage(chatId,
         `💰 <b>Your Balance</b>\n\nYou have <b>${userData.points} points</b>.`,
         await mainMenuKeyboard());
 
-    } else if (text === '/referral' || text === '🔗 Referral Link') {
+    } else if (text === '/referral' || text === '🔗 Referral Link' || text === '/invite') {
       const link = `https://t.me/${BOT_USERNAME}?start=${userId}`;
       await sendMessage(chatId,
         `🔗 <b>Your Referral Link</b>\n\n<code>${link}</code>\n\n✅ Earn <b>10 points</b> per new user!`,
@@ -494,9 +514,9 @@ module.exports = async function handler(req, res) {
         }
       }
 
-    } else if (text === '/help' || text === '📋 Commands') {
+    } else if (text === '/help' || text === '📋 Commands' || text === '/allmenu') {
       await sendMessage(chatId,
-        `📋 <b>Commands</b>\n\n/start — Start bot\n/points — Check balance\n/referral — Get referral link\n/code CODE — Redeem a code\n/help — This menu`,
+        `📋 <b>Commands</b>\n\n/start — Start bot\n/balance — Check balance\n/invite — Get referral link\n/daily — Claim 1 free daily point\n/code CODE — Redeem a code\n/help — View command list`,
         await mainMenuKeyboard());
 
     } else {
@@ -532,4 +552,4 @@ module.exports = async function handler(req, res) {
     console.error('Webhook error:', err.message);
     return res.status(200).json({ ok: true });
   }
-      }
+};
