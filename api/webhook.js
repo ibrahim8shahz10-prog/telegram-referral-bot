@@ -2,7 +2,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY
 );
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -56,11 +56,12 @@ async function getChannels() {
 }
 
 async function getUser(userId) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('users')
     .select('*')
     .eq('telegram_id', userId)
-    .single();
+    .maybeSingle();
+  if (error) console.error('getUser error:', error.message);
   return data || null;
 }
 
@@ -111,7 +112,6 @@ function forceJoinKeyboard(channels) {
   return { inline_keyboard: buttons };
 }
 
-// ─── PENDING REFERRERS (in memory) ────────────
 const pendingReferrers = {};
 
 module.exports = async function handler(req, res) {
@@ -137,19 +137,18 @@ module.exports = async function handler(req, res) {
         const channels = await getChannels();
 
         if (channels.length === 0) {
-          const existing = await getUser(userId);
-          if (!existing) {
-            await supabase.from('users').insert({
-              telegram_id: userId,
-              username,
-              first_name: firstName,
-              points: 0,
-              referrer_id: null,
-            });
-          }
-          await editMessage(chatId, messageId, `✅ <b>Welcome ${firstName}!</b>\n\nYou now have full access!`, null);
+          await supabase.from('users').upsert({
+            telegram_id: userId,
+            username,
+            first_name: firstName,
+            points: 0,
+            referrer_id: null,
+          }, { onConflict: 'telegram_id' });
+
+          await editMessage(chatId, messageId,
+            `✅ <b>Welcome ${firstName}!</b>\n\nYou now have full access!`, null);
           const menuKb = await mainMenuKeyboard();
-          await sendMessage(chatId, `🏠 <b>Main Menu</b>`, menuKb);
+          await sendMessage(chatId, `🏠 <b>Main Menu</b>\n\nChoose an option:`, menuKb);
           return res.status(200).json({ ok: true });
         }
 
@@ -165,23 +164,24 @@ module.exports = async function handler(req, res) {
             forceJoinKeyboard(channels)
           );
         } else {
-          const existing = await getUser(userId);
-          if (!existing) {
-            const referrerId = pendingReferrers[userId] || null;
-            await supabase.from('users').insert({
-              telegram_id: userId,
-              username,
-              first_name: firstName,
-              points: 0,
-              referrer_id: null,
+          const referrerId = pendingReferrers[userId] || null;
+
+          const { error: upsertError } = await supabase.from('users').upsert({
+            telegram_id: userId,
+            username,
+            first_name: firstName,
+            points: 0,
+            referrer_id: null,
+          }, { onConflict: 'telegram_id' });
+
+          if (upsertError) console.error('upsert error:', upsertError.message);
+
+          if (referrerId) {
+            await supabase.rpc('increment_points', {
+              user_telegram_id: referrerId,
+              amount: 10,
             });
-            if (referrerId) {
-              await supabase.rpc('increment_points', {
-                user_telegram_id: referrerId,
-                amount: 10,
-              });
-              delete pendingReferrers[userId];
-            }
+            delete pendingReferrers[userId];
           }
 
           await editMessage(chatId, messageId,
@@ -213,7 +213,6 @@ module.exports = async function handler(req, res) {
     if (text.startsWith('/start')) {
       const parts = text.split(' ');
       const referrerId = (parts[1] && parts[1] !== userId) ? parts[1] : null;
-
       const existingUser = await getUser(userId);
 
       if (existingUser) {
@@ -223,23 +222,24 @@ module.exports = async function handler(req, res) {
           menuKb
         );
       } else {
-        if (referrerId) {
-          pendingReferrers[userId] = referrerId;
-        }
+        if (referrerId) pendingReferrers[userId] = referrerId;
 
         const channels = await getChannels();
 
         if (channels.length === 0) {
-          await supabase.from('users').insert({
+          const { error } = await supabase.from('users').upsert({
             telegram_id: userId,
             username,
             first_name: firstName,
             points: 0,
             referrer_id: null,
-          });
+          }, { onConflict: 'telegram_id' });
+
+          if (error) console.error('insert error:', error.message);
+
           const menuKb = await mainMenuKeyboard();
           await sendMessage(chatId,
-            `👋 <b>Welcome, ${firstName}!</b>\n\nYou are now registered!`,
+            `👋 <b>Welcome, ${firstName}!</b>\n\nYou are now registered!\n\nChoose an option:`,
             menuKb
           );
         } else {
@@ -532,4 +532,4 @@ module.exports = async function handler(req, res) {
     console.error('Webhook error:', err.message);
     return res.status(200).json({ ok: true });
   }
-    }
+      }
