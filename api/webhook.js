@@ -1,486 +1,625 @@
-const { createClient } = require('@supabase/supabase-js');
+const express = require('express');
+const TelegramBot = require('node-telegram-bot-api');
+const supabase = require('../db');
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY
-);
+const app = express();
+app.use(express.json());
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const BOT_USERNAME = 'ReActsHelPer_bot';
-const ADMIN_ID = process.env.ADMIN_ID ? process.env.ADMIN_ID.toString() : '';
+const bot = new TelegramBot(BOT_TOKEN);
 
-async function sendMessage(chatId, text, keyboard = null) {
-  const body = { chat_id: chatId, text, parse_mode: 'HTML' };
-  if (keyboard) body.reply_markup = keyboard;
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-}
-
-async function editMessage(chatId, messageId, text, keyboard = null) {
-  const body = { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML' };
-  if (keyboard) body.reply_markup = keyboard;
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-}
-
-async function answerCallback(callbackId, text = '') {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: callbackId, text }),
-  });
-}
-
-async function checkMembership(userId, channelUsername) {
+async function getSetting(key) {
   try {
-    const res = await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=@${channelUsername}&user_id=${userId}`
-    );
-    const data = await res.json();
-    const status = data?.result?.status;
-    return ['member', 'administrator', 'creator'].includes(status);
-  } catch {
-    return false;
-  }
+    const { data } = await supabase
+      .from('settings').select('value').eq('key', key).single();
+    return data ? data.value : null;
+  } catch { return null; }
+}
+
+async function isAdmin(telegramId) {
+  try {
+    const { data } = await supabase
+      .from('admins').select('id').eq('telegram_id', telegramId).single();
+    return !!data;
+  } catch { return false; }
+}
+
+async function getUser(telegramId) {
+  try {
+    const { data } = await supabase
+      .from('users').select('*').eq('telegram_id', telegramId).single();
+    return data;
+  } catch { return null; }
 }
 
 async function getChannels() {
-  const { data } = await supabase.from('required_channels').select('*');
-  return data || [];
+  try {
+    const { data } = await supabase
+      .from('required_channels').select('*').eq('is_active', true);
+    return data || [];
+  } catch { return []; }
 }
 
-async function getUser(userId) {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('telegram_id', userId.toString())
-    .maybeSingle();
-  if (error) console.error('getUser error:', error.message);
-  return data || null;
+async function checkUserInChannel(userId, channelId) {
+  try {
+    const member = await bot.getChatMember(channelId, userId);
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch { return false; }
 }
 
-async function getPanels() {
-  const { data } = await supabase
-    .from('panels')
-    .select('*')
-    .eq('is_active', true)
-    .order('id');
-  return data || [];
-}
-
-async function mainMenuKeyboard() {
-  const panels = await getPanels();
-  const rows = [];
-  for (let i = 0; i < panels.length; i += 2) {
-    const row = [{ text: `${panels[i].name}` }];
-    if (panels[i + 1]) row.push({ text: `${panels[i + 1].name}` });
-    rows.push(row);
+async function verifyAllChannels(userId) {
+  const channels = await getChannels();
+  for (const ch of channels) {
+    const joined = await checkUserInChannel(userId, ch.channel_id);
+    if (!joined) return false;
   }
-  rows.push([{ text: '💰 My Points' }, { text: '🔗 Referral Link' }]);
-  rows.push([{ text: '🎁 Redeem Code' }, { text: '📋 Commands' }]);
-  return { keyboard: rows, resize_keyboard: true, persistent: true };
+  return true;
 }
 
-function adminMenuKeyboard() {
-  return {
-    keyboard: [
-      [{ text: '➕ Add Panel' }, { text: '✏️ Edit Panel' }],
-      [{ text: '❌ Delete Panel' }, { text: '📋 List Panels' }],
-      [{ text: '🎟 Create Code' }, { text: '📋 List Codes' }],
-      [{ text: '📢 Add Channel' }, { text: '🗑 Remove Channel' }],
-      [{ text: '👥 All Users' }, { text: '💰 Give Points' }],
-      [{ text: '🏠 Main Menu' }]
-    ],
-    resize_keyboard: true,
-    persistent: true
-  };
+async function getRank(credits) {
+  if (credits >= 500) return 'Diamond 💎';
+  if (credits >= 200) return 'Gold 🥇';
+  if (credits >= 50) return 'Silver 🥈';
+  return 'Bronze 🥉';
 }
 
-function forceJoinKeyboard(channels) {
-  if (!channels || channels.length === 0) return null;
-  const buttons = channels.map(c => ([{
-    text: `📢 Join ${c.channel_name}`,
-    url: c.invite_link
+async function sendVerification(chatId) {
+  const channels = await getChannels();
+  const botName = await getSetting('bot_name') || 'LEAKED STUFF';
+
+  let text = `🔒 *CHANNEL VERIFICATION*\n\n`;
+  text += `📦 To use *${botName}*, join ALL channels below:\n\n`;
+  channels.forEach(ch => {
+    text += `📢 [${ch.channel_name}](${ch.channel_link})\n`;
+  });
+  text += `\n─────────────────\n`;
+  text += `⚠️ After joining, tap *Verify Now*.`;
+
+  const buttons = channels.map(ch => ([{
+    text: `📢 ${ch.channel_name}`, url: ch.channel_link
   }]));
-  buttons.push([{ text: '✅ I Joined — Verify Me', callback_data: 'verify' }]);
-  return { inline_keyboard: buttons };
+  buttons.push([{
+    text: '✅ I\'ve Joined – Verify Now', callback_data: 'verify_now'
+  }]);
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons }
+  });
 }
 
-const pendingReferrers = {};
+async function sendMainMenu(chatId, user) {
+  const rank = await getRank(user.credits);
+  const { count: refs } = await supabase
+    .from('referrals').select('id', { count: 'exact' })
+    .eq('referrer_id', user.telegram_id);
 
-module.exports = async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(200).send('Bot is running ✅');
-  }
+  const text =
+    `⭐ *LEAKED STUFF* ⭐\n─────────────────\n` +
+    `Welcome, *${user.first_name || 'User'}*!\n\n` +
+    `👤 *YOUR STATS*\n` +
+    `• Rank: ${rank}\n` +
+    `• Credits: ${user.credits} 💰\n` +
+    `• Referrals: ${refs || 0} 🔗\n` +
+    `─────────────────\n📱 *MAIN MENU*`;
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '📦 Browse Files', callback_data: 'browse_files' }],
+        [
+          { text: '🔗 My Referrals', callback_data: 'my_referrals' },
+          { text: '🏆 Leaderboard', callback_data: 'leaderboard' }
+        ],
+        [
+          { text: '💰 My Credits', callback_data: 'my_credits' },
+          { text: '❓ Help', callback_data: 'help' }
+        ]
+      ]
+    }
+  });
+}
+
+async function handleStart(msg, referralCode) {
+  const chatId = msg.chat.id;
+  const telegramId = msg.from.id;
+  const username = msg.from.username || null;
+  const firstName = msg.from.first_name || 'User';
 
   try {
-    const body = req.body;
+    let user = await getUser(telegramId);
 
-    // ─── CALLBACK QUERIES (Inline Buttons Only) ─────────────────────
-    if (body.callback_query) {
-      const cb = body.callback_query;
-      const userId = cb.from.id.toString();
-      const chatId = cb.message.chat.id;
-      const messageId = cb.message.message_id;
-      const firstName = cb.from.first_name || 'User';
-      const username = cb.from.username || '';
-
-      await answerCallback(cb.id, '⏳ Checking...');
-
-      if (cb.data === 'verify') {
-        const channels = await getChannels();
-        const referrerId = pendingReferrers[userId] || null;
-        const existingUser = await getUser(userId);
-        const initialPoints = existingUser ? existingUser.points : 0;
-
-        if (channels.length === 0) {
-          await supabase.from('users').upsert({
-            telegram_id: userId,
-            username,
-            first_name: firstName,
-            points: initialPoints,
-            referrer_id: referrerId,
-          }, { onConflict: 'telegram_id' });
-
-          await editMessage(chatId, messageId, `✅ <b>Welcome ${firstName}!</b>\n\nYou now have full access!`, null);
-          const menuKb = await mainMenuKeyboard();
-          await sendMessage(chatId, `🏠 <b>Main Menu</b>\n\nChoose an option:`, menuKb);
-          return res.status(200).json({ ok: true });
-        }
-
-        const results = await Promise.all(
-          channels.map(c => checkMembership(userId, c.channel_username))
-        );
-        const notJoined = channels.filter((_, i) => !results[i]);
-
-        if (notJoined.length > 0) {
-          const names = notJoined.map(c => `❌ ${c.channel_name}`).join('\n');
-          await editMessage(chatId, messageId,
-            `⚠️ <b>Not joined yet!</b>\n\nStill need:\n${names}\n\nJoin and press Verify again.`,
-            forceJoinKeyboard(channels)
-          );
-        } else {
-          await supabase.from('users').upsert({
-            telegram_id: userId,
-            username,
-            first_name: firstName,
-            points: initialPoints,
-            referrer_id: referrerId,
-          }, { onConflict: 'telegram_id' });
-
-          if (referrerId && !existingUser) {
-            await supabase.rpc('increment_points', {
-              user_telegram_id: referrerId,
-              amount: 10,
-            });
-            delete pendingReferrers[userId];
-          }
-
-          await editMessage(chatId, messageId, `✅ <b>Verified! Welcome ${firstName}!</b>\n\nYou now have full access! 🎉`, null);
-          const menuKb = await mainMenuKeyboard();
-          await sendMessage(chatId, `🏠 <b>Main Menu</b>\n\nHello ${firstName}! Choose an option:`, menuKb);
-        }
+    if (!user) {
+      let referredBy = null;
+      if (referralCode && referralCode.startsWith('ref_')) {
+        const referrerId = parseInt(referralCode.replace('ref_', ''));
+        if (referrerId !== telegramId) referredBy = referrerId;
       }
-      return res.status(200).json({ ok: true });
+      const { error } = await supabase.from('users').insert({
+        telegram_id: telegramId,
+        username,
+        first_name: firstName,
+        credits: 0,
+        referred_by: referredBy,
+        is_verified: false
+      });
+      if (error) {
+        console.error('Insert user error:', JSON.stringify(error));
+        return bot.sendMessage(chatId, '❌ Error creating account. Please try again.');
+      }
+      user = await getUser(telegramId);
     }
 
-    // ─── MESSAGES (Text Input & Custom Menu Keyboards) ─────────────────────────────
-    const { message } = body;
-    if (!message || !message.text) return res.status(200).json({ ok: true });
-
-    const chatId = message.chat.id;
-    const text = message.text.trim();
-    const userId = message.from.id.toString();
-    const username = message.from.username || '';
-    const firstName = message.from.first_name || 'User';
-    const isAdmin = userId === ADMIN_ID;
-
-    // ─── Open /start Command ───────────────────────────────
-    if (text.startsWith('/start')) {
-      const parts = text.split(' ');
-      const referrerId = (parts[1] && parts[1] !== userId) ? parts[1].toString() : null;
-      const existingUser = await getUser(userId);
-
-      if (existingUser) {
-        const menuKb = await mainMenuKeyboard();
-        await sendMessage(chatId, `👋 <b>Welcome back, ${firstName}!</b>\n\n💰 Points: <b>${existingUser.points}</b>\n\nChoose an option:`, menuKb);
-      } else {
-        if (referrerId) pendingReferrers[userId] = referrerId;
-        const channels = await getChannels();
-
-        if (channels.length === 0) {
-          await supabase.from('users').upsert({
-            telegram_id: userId,
-            username,
-            first_name: firstName,
-            points: 0,
-            referrer_id: referrerId,
-          }, { onConflict: 'telegram_id' });
-
-          const menuKb = await mainMenuKeyboard();
-          await sendMessage(chatId, `👋 <b>Welcome, ${firstName}!</b>\n\nYou are now registered!\n\nChoose an option:`, menuKb);
-        } else {
-          await sendMessage(chatId, `👋 <b>Welcome to the bot, ${firstName}!</b>\n\n🔒 Please join all channels below first.\n\nAfter joining press ✅ <b>Verify</b>.`, forceJoinKeyboard(channels));
-        }
-      }
-      return res.status(200).json({ ok: true });
+    if (!user) {
+      return bot.sendMessage(chatId, '❌ Could not load your account. Try /start again.');
     }
 
-    // ─── Open /admin Menu ───────────────────────────────
-    if (text === '/admin') {
-      if (!isAdmin) {
-        await sendMessage(chatId, `❌ Not authorized.`);
-      } else {
-        await sendMessage(chatId, `🔐 <b>Admin Panel</b>\n\nWelcome Admin!`, adminMenuKeyboard());
-      }
-      return res.status(200).json({ ok: true });
+    if (user.is_banned) {
+      return bot.sendMessage(chatId, '🚫 You are banned.');
     }
 
-    // ─── GLOBAL ADMIN COMMAND HANDLERS ───────────────────────
-    if (isAdmin) {
-      if (text === '➕ Add Panel') {
-        await sendMessage(chatId, `➕ <b>Add Panel</b>\n\nFormat:\n<code>/addpanel Name | Price | Description | Content</code>\n\nExample:\n<code>/addpanel VIP Panel | 50 | VIP Access | Login info here</code>`, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/addpanel ')) {
-        const parts = text.replace('/addpanel ', '').split('|').map(s => s.trim());
-        if (parts.length < 4) {
-          await sendMessage(chatId, `❌ Wrong format!\n<code>/addpanel Name | Price | Description | Content</code>`, adminMenuKeyboard());
-        } else {
-          await supabase.from('panels').insert({ name: parts[0], price: parseInt(parts[1]) || 0, description: parts[2], content: parts[3], is_active: true });
-          await sendMessage(chatId, `✅ Panel <b>${parts[0]}</b> added!\n💰 Price: ${parts[1]} pts`, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '📋 List Panels') {
-        const panels = await getPanels();
-        if (panels.length === 0) {
-          await sendMessage(chatId, `No panels found.`, adminMenuKeyboard());
-        } else {
-          let list = `📋 <b>All Panels</b>\n\n`;
-          panels.forEach(p => { list += `ID: <b>${p.id}</b> | ${p.name} | ${p.price} pts\n`; });
-          await sendMessage(chatId, list, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '✏️ Edit Panel') {
-        const panels = await getPanels();
-        let list = `✏️ <b>Edit Panel</b>\n\nFormat:\n<code>/editpanel ID | Name | Price | Description | Content</code>\n\nPanels:\n`;
-        panels.forEach(p => { list += `ID <b>${p.id}</b> — ${p.name} (${p.price} pts)\n`; });
-        await sendMessage(chatId, list, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/editpanel ')) {
-        const parts = text.replace('/editpanel ', '').split('|').map(s => s.trim());
-        if (parts.length < 5) {
-          await sendMessage(chatId, `❌ Wrong format!\n<code>/editpanel ID | Name | Price | Description | Content</code>`, adminMenuKeyboard());
-        } else {
-          await supabase.from('panels').update({ name: parts[1], price: parseInt(parts[2]) || 0, description: parts[3], content: parts[4] }).eq('id', parseInt(parts[0]));
-          await sendMessage(chatId, `✅ Panel ID <b>${parts[0]}</b> updated!`, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '❌ Delete Panel') {
-        const panels = await getPanels();
-        let list = `❌ <b>Delete Panel</b>\n\nSend: <code>/deletepanel ID</code>\n\n`;
-        panels.forEach(p => { list += `ID <b>${p.id}</b> — ${p.name}\n`; });
-        await sendMessage(chatId, list, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/deletepanel ')) {
-        const id = parseInt(text.replace('/deletepanel ', '').trim());
-        await supabase.from('panels').update({ is_active: false }).eq('id', id);
-        await sendMessage(chatId, `✅ Panel ID <b>${id}</b> deleted.`, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '🎟 Create Code') {
-        await sendMessage(chatId, `🎟 <b>Create Code</b>\n\nFormat:\n<code>/createcode CODE | Points | MaxUses</code>\n\nExample:\n<code>/createcode PROMO100 | 100 | 50</code>`, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/createcode ')) {
-        const parts = text.replace('/createcode ', '').split('|').map(s => s.trim());
-        if (parts.length < 3) {
-          await sendMessage(chatId, `❌ Wrong format!\n<code>/createcode CODE | Points | MaxUses</code>`, adminMenuKeyboard());
-        } else {
-          await supabase.from('redeem_codes').insert({
-            code: parts[0].toUpperCase(),
-            points: parseInt(parts[1]) || 10,
-            max_uses: parseInt(parts[2]) || 1,
-            used_count: 0,
-          });
-          await sendMessage(chatId, `✅ Code <b>${parts[0].toUpperCase()}</b> created!\n💰 ${parts[1]} pts | Max: ${parts[2]}`, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-
-      // FIXED BUG: Code structural error handling fixed to load all items correctly
-      if (text === '📋 List Codes') {
-        const { data: codes, error: codeErr } = await supabase.from('redeem_codes').select('*');
-        if (codeErr) console.error('List Codes database error:', codeErr.message);
-
-        if (!codes || codes.length === 0) {
-          await sendMessage(chatId, `No codes found in database matching selection.`, adminMenuKeyboard());
-        } else {
-          let list = `📋 <b>All Codes</b>\n\n`;
-          codes.forEach(c => { list += `🎟 <b>${c.code}</b> — ${c.points} pts | ${c.used_count}/${c.max_uses}\n`; });
-          await sendMessage(chatId, list, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '📢 Add Channel') {
-        await sendMessage(chatId, `📢 <b>Add Channel</b>\n\nFormat:\n<code>/addchannel username | Name | link</code>`, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/addchannel ')) {
-        const parts = text.replace('/addchannel ', '').split('|').map(s => s.trim());
-        if (parts.length < 3) {
-          await sendMessage(chatId, `❌ Wrong format!\n<code>/addchannel username | Name | link</code>`, adminMenuKeyboard());
-        } else {
-          await supabase.from('required_channels').insert({ channel_username: parts[0], channel_name: parts[1], invite_link: parts[2] });
-          await sendMessage(chatId, `✅ Channel <b>${parts[1]}</b> added!`, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '🗑 Remove Channel') {
-        const channels = await getChannels();
-        if (channels.length === 0) {
-          await sendMessage(chatId, `No channels found.`, adminMenuKeyboard());
-        } else {
-          let list = `🗑 <b>Remove Channel</b>\n\nSend: <code>/removechannel ID</code>\n\n`;
-          channels.forEach(c => { list += `ID <b>${c.id}</b> — ${c.channel_name}\n`; });
-          await sendMessage(chatId, list, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/removechannel ')) {
-        const id = parseInt(text.replace('/removechannel ', '').trim());
-        await supabase.from('required_channels').delete().eq('id', id);
-        await sendMessage(chatId, `✅ Channel removed.`, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '👥 All Users') {
-        const { data: users } = await supabase.from('users').select('*').order('points', { ascending: false }).limit(20);
-        if (!users || users.length === 0) {
-          await sendMessage(chatId, `No users yet.`, adminMenuKeyboard());
-        } else {
-          let list = `👥 <b>All Users</b>\n\n`;
-          users.forEach((u, i) => { list += `${i + 1}. <b>${u.first_name || u.username}</b> — ${u.points} pts — <code>${u.telegram_id}</code>\n`; });
-          await sendMessage(chatId, list, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '💰 Give Points') {
-        await sendMessage(chatId, `💰 <b>Give Points</b>\n\nFormat:\n<code>/givepoints TelegramID | Points</code>`, adminMenuKeyboard());
-        return res.status(200).json({ ok: true });
-      }
-      if (text.startsWith('/givepoints ')) {
-        const parts = text.replace('/givepoints ', '').split('|').map(s => s.trim());
-        if (parts.length < 2) {
-          await sendMessage(chatId, `❌ Wrong format!\n<code>/givepoints TelegramID | Points</code>`, adminMenuKeyboard());
-        } else {
-          await supabase.rpc('increment_points', { user_telegram_id: parts[0].toString(), amount: parseInt(parts[1]) });
-          await sendMessage(chatId, `✅ Gave <b>${parts[1]} points</b> to <b>${parts[0]}</b>`, adminMenuKeyboard());
-        }
-        return res.status(200).json({ ok: true });
-      }
-      if (text === '🏠 Main Menu') {
-        const menuKb = await mainMenuKeyboard();
-        await sendMessage(chatId, `🏠 <b>Main Menu</b>`, menuKb);
-        return res.status(200).json({ ok: true });
-      }
+    if (!user.is_verified) {
+      return sendVerification(chatId);
     }
 
-    // ─── USER COMMAND HANDLERS (Safe Verification Fail Safe) ────────────────────────
-    const userData = await getUser(userId);
-
-    if (!userData) {
-      const channels = await getChannels();
-      await sendMessage(chatId,
-        `⚠️ Please send /start first to register.`,
-        channels.length > 0 ? forceJoinKeyboard(channels) : null
-      );
-      return res.status(200).json({ ok: true });
-    }
-
-    if (text === '/daily' || text === '🎁 Daily Reward') {
-      const now = new Date();
-      const lastClaim = userData.last_daily_claim ? new Date(userData.last_daily_claim) : null;
-
-      if (lastClaim && (now - lastClaim) < 24 * 60 * 60 * 1000) {
-        const nextClaimTime = new Date(lastClaim.getTime() + 24 * 60 * 60 * 1000);
-        const hoursLeft = Math.ceil((nextClaimTime - now) / (1000 * 60 * 60));
-        await sendMessage(chatId, `❌ You already claimed your daily reward. Try again in <b>${hoursLeft} hours</b>.`, await mainMenuKeyboard());
-      } else {
-        await supabase.rpc('increment_points', { user_telegram_id: userId, amount: 1 });
-        await supabase.from('users').update({ last_daily_claim: now.toISOString() }).eq('telegram_id', userId);
-        await sendMessage(chatId, `🎁 <b>Daily Reward Claimed!</b>\n\n+1 Point added to your profile balance.`, await mainMenuKeyboard());
-      }
-      return res.status(200).json({ ok: true });
-    }
-
-    if (text === '/points' || text === '💰 My Points' || text === '/balance') {
-      await sendMessage(chatId, `💰 <b>Your Balance</b>\n\nYou have <b>${userData.points} points</b>.`, await mainMenuKeyboard());
-
-    } else if (text === '/referral' || text === '🔗 Referral Link' || text === '/invite') {
-      const link = `https://t.me/${BOT_USERNAME}?start=${userId}`;
-      await sendMessage(chatId, `🔗 <b>Your Referral Link</b>\n\n<code>${link}</code>\n\n✅ Earn <b>10 points</b> per new user!`, await mainMenuKeyboard());
-
-    } else if (text === '/redeem' || text === '🎁 Redeem Code') {
-      await sendMessage(chatId, `🎁 Send: <code>/code YOURCODE</code>`, await mainMenuKeyboard());
-
-    } else if (text.startsWith('/code ')) {
-      const code = text.replace('/code ', '').trim().toUpperCase();
-      const { data: codeData } = await supabase.from('redeem_codes').select('*').eq('code', code).single();
-      if (!codeData) {
-        await sendMessage(chatId, `❌ Invalid code.`, await mainMenuKeyboard());
-      } else if (codeData.used_count >= codeData.max_uses) {
-        await sendMessage(chatId, `❌ Code expired.`, await mainMenuKeyboard());
-      } else {
-        const { data: alreadyUsed } = await supabase.from('used_codes').select('*').eq('telegram_id', userId).eq('code', code).single();
-        if (alreadyUsed) {
-          await sendMessage(chatId, `❌ Already used.`, await mainMenuKeyboard());
-        } else {
-          await supabase.rpc('increment_points', { user_telegram_id: userId, amount: codeData.points });
-          await supabase.from('used_codes').insert({ telegram_id: userId, code });
-          await supabase.from('redeem_codes').update({ used_count: codeData.used_count + 1 }).eq('code', code);
-          await sendMessage(chatId, `✅ <b>Redeemed!</b> Got <b>${codeData.points} points!</b>\nNew balance: <b>${userData.points + codeData.points} pts</b>`, await mainMenuKeyboard());
-        }
-      }
-
-    } else if (text === '/help' || text === '📋 Commands' || text === '/allmenu') {
-      await sendMessage(chatId, `📋 <b>Commands</b>\n\n/start — Start bot\n/balance — Check balance\n/invite — Get referral link\n/daily — Claim 1 free daily point\n/code CODE — Redeem a code\n/help — View command list`, await mainMenuKeyboard());
-
-    } else {
-      const panels = await getPanels();
-      const matchedPanel = panels.find(p => text.startsWith(p.name));
-
-      if (matchedPanel) {
-        const { data: alreadyBought } = await supabase
-          .from('user_panels').select('*')
-          .eq('telegram_id', userId).eq('panel_id', matchedPanel.id).single();
-
-        if (alreadyBought) {
-          await sendMessage(chatId, `✅ <b>${matchedPanel.name}</b>\n\nYou already have access!\n\n📋 <b>Content:</b>\n${matchedPanel.content}`, await mainMenuKeyboard());
-        } else if (userData.points < matchedPanel.price) {
-          await sendMessage(chatId, `❌ <b>Not enough points!</b>\n\n${matchedPanel.name} costs <b>${matchedPanel.price} pts</b>\nYou have <b>${userData.points} pts</b>`, await mainMenuKeyboard());
-        } else {
-          await supabase.rpc('increment_points', { user_telegram_id: userId, amount: -matchedPanel.price });
-          await supabase.from('user_panels').insert({ telegram_id: userId, panel_id: matchedPanel.id });
-          await sendMessage(chatId, `✅ <b>Purchased!</b>\n\n📌 <b>${matchedPanel.name}</b>\n\n📋 <b>Content:</b>\n${matchedPanel.content}\n\n💰 Spent: ${matchedPanel.price} pts\nLeft: <b>${userData.points - matchedPanel.price} pts</b>`, await mainMenuKeyboard());
-        }
-      }
-    }
-
-    return res.status(200).json({ ok: true });
+    return sendMainMenu(chatId, user);
 
   } catch (err) {
-    console.error('Webhook error:', err.message);
-    return res.status(200).json({ ok: true });
+    console.error('handleStart error:', err.message);
+    return bot.sendMessage(chatId, '❌ Something went wrong. Please try /start again.');
   }
-};
+}
+
+async function handleVerifyNow(callbackQuery) {
+  const chatId = callbackQuery.message.chat.id;
+  const telegramId = callbackQuery.from.id;
+
+  try {
+    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Checking...' });
+    const allJoined = await verifyAllChannels(telegramId);
+
+    if (!allJoined) {
+      return bot.sendMessage(chatId,
+        '❌ You haven\'t joined all channels yet!\n\nJoin ALL channels then tap Verify again.'
+      );
+    }
+
+    await supabase.from('users')
+      .update({ is_verified: true }).eq('telegram_id', telegramId);
+
+    const user = await getUser(telegramId);
+
+    if (user && user.referred_by) {
+      const { data: alreadyRewarded } = await supabase
+        .from('referrals').select('id')
+        .eq('referred_id', telegramId).single();
+
+      if (!alreadyRewarded) {
+        const refCredits = parseInt(await getSetting('referral_credits') || '5');
+        await supabase.from('referrals').insert({
+          referrer_id: user.referred_by,
+          referred_id: telegramId,
+          credits_awarded: refCredits
+        });
+        await supabase.rpc('increment_credits', {
+          user_tid: user.referred_by, amount: refCredits
+        });
+        try {
+          await bot.sendMessage(user.referred_by,
+            `🎉 Someone joined via your link!\n+${refCredits} credits added! 💰`
+          );
+        } catch {}
+      }
+    }
+
+    await bot.sendMessage(chatId, '✅ Verified! Welcome!');
+    const updatedUser = await getUser(telegramId);
+    return sendMainMenu(chatId, updatedUser);
+
+  } catch (err) {
+    console.error('handleVerifyNow error:', err.message);
+    return bot.sendMessage(chatId, '❌ Verification failed. Try again.');
+  }
+}
+
+async function handleBrowseFiles(chatId) {
+  const { data: files } = await supabase
+    .from('files').select('*').eq('is_active', true)
+    .order('created_at', { ascending: false });
+
+  if (!files || files.length === 0) {
+    return bot.sendMessage(chatId, '📭 No files available yet!', {
+      reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'main_menu' }]] }
+    });
+  }
+
+  const buttons = files.map(f => ([{
+    text: `📦 ${f.name} (💰${f.price_credits})`,
+    callback_data: `file_${f.id}`
+  }]));
+  buttons.push([{ text: '⬅️ Back', callback_data: 'main_menu' }]);
+
+  await bot.sendMessage(chatId, `📦 *AVAILABLE FILES*\n─────────────────\nTap any file to view:`, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function handleViewFile(chatId, telegramId, fileId) {
+  const { data: file } = await supabase
+    .from('files').select('*').eq('id', fileId).single();
+  if (!file) return bot.sendMessage(chatId, '❌ File not found.');
+
+  const { data: purchase } = await supabase
+    .from('purchases').select('id')
+    .eq('user_telegram_id', telegramId).eq('file_id', fileId).single();
+
+  const user = await getUser(telegramId);
+  let text = `📦 *${file.name}*\n─────────────────\n`;
+  text += `📝 ${file.description || 'No description'}\n\n`;
+  text += `💰 Price: *${file.price_credits} credits*\n`;
+
+  const buttons = [];
+  if (purchase) {
+    text += `\n✅ *Already Unlocked*\n\n${file.content}`;
+    buttons.push([{ text: '⬅️ Back', callback_data: 'browse_files' }]);
+  } else {
+    text += `\nYour credits: *${user.credits}*`;
+    buttons.push([{ text: `🔓 Unlock for ${file.price_credits} Credits`, callback_data: `buy_${fileId}` }]);
+    buttons.push([{ text: '⬅️ Back', callback_data: 'browse_files' }]);
+  }
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function handleBuyFile(chatId, telegramId, fileId) {
+  const user = await getUser(telegramId);
+  const { data: file } = await supabase
+    .from('files').select('*').eq('id', fileId).single();
+  if (!file) return bot.sendMessage(chatId, '❌ File not found.');
+
+  if (user.credits < file.price_credits) {
+    return bot.sendMessage(chatId,
+      `❌ Not enough credits!\nYou have *${user.credits}* but need *${file.price_credits}*.\nShare referral link to earn more!`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  await supabase.from('users')
+    .update({ credits: user.credits - file.price_credits })
+    .eq('telegram_id', telegramId);
+
+  await supabase.from('purchases').insert({
+    user_telegram_id: telegramId, file_id: fileId,
+    credits_spent: file.price_credits
+  });
+
+  await bot.sendMessage(chatId,
+    `✅ *Unlocked!*\n─────────────────\n📦 *${file.name}*\n\n${file.content}`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
+async function handleMyReferrals(chatId, telegramId) {
+  const { data: refs, count } = await supabase
+    .from('referrals').select('*', { count: 'exact' })
+    .eq('referrer_id', telegramId);
+  const totalCredits = refs ? refs.reduce((s, r) => s + r.credits_awarded, 0) : 0;
+  const refCredits = await getSetting('referral_credits') || '5';
+
+  await bot.sendMessage(chatId,
+    `🔗 *MY REFERRALS*\n─────────────────\n\n` +
+    `👥 Total referred: *${count || 0}*\n` +
+    `💰 Credits earned: *${totalCredits}*\n\n` +
+    `🔗 *Your Referral Link:*\n` +
+    `https://t.me/${process.env.BOT_USERNAME}?start=ref_${telegramId}\n\n` +
+    `Each join = *+${refCredits} credits!* 💰`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'main_menu' }]] }
+    }
+  );
+}
+
+async function handleLeaderboard(chatId) {
+  const { data: users } = await supabase
+    .from('users').select('first_name, username, credits')
+    .eq('is_verified', true).order('credits', { ascending: false }).limit(10);
+
+  if (!users || users.length === 0) {
+    return bot.sendMessage(chatId, '🏆 No users yet!');
+  }
+
+  const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
+  let text = `🏆 *LEADERBOARD*\n─────────────────\n\n`;
+  users.forEach((u, i) => {
+    const name = u.username ? `@${u.username}` : u.first_name || 'User';
+    text += `${medals[i]} ${name} — *${u.credits} credits*\n`;
+  });
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'main_menu' }]] }
+  });
+}
+
+async function handleHelp(chatId) {
+  await bot.sendMessage(chatId,
+    `❓ *HELP*\n─────────────────\n\n` +
+    `📦 *Browse Files* — Unlock files using credits\n\n` +
+    `🔗 *Referrals* — Share link, earn credits per join\n\n` +
+    `🏆 *Leaderboard* — Top users by credits\n\n` +
+    `💰 *Credits* — Used to unlock files\n\n` +
+    `─────────────────\nFor support contact admin.`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'main_menu' }]] }
+    }
+  );
+}
+
+async function handleAdmin(chatId, telegramId) {
+  const admin = await isAdmin(telegramId);
+  if (!admin) return bot.sendMessage(chatId, '🚫 Access denied.');
+
+  await bot.sendMessage(chatId, `⚙️ *ADMIN PANEL*\n─────────────────`, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '📦 Add File', callback_data: 'admin_add_file' }],
+        [{ text: '📋 List Files', callback_data: 'admin_list_files' }],
+        [{ text: '📢 Add Channel', callback_data: 'admin_add_channel' }],
+        [{ text: '📋 List Channels', callback_data: 'admin_list_channels' }],
+        [{ text: '📡 Broadcast', callback_data: 'admin_broadcast' }],
+        [{ text: '👥 User Stats', callback_data: 'admin_stats' }],
+        [{ text: '⚙️ Set Referral Credits', callback_data: 'admin_set_ref_credits' }]
+      ]
+    }
+  });
+}
+
+async function handleAdminStats(chatId) {
+  const { count: totalUsers } = await supabase.from('users').select('*', { count: 'exact' });
+  const { count: verifiedUsers } = await supabase.from('users').select('*', { count: 'exact' }).eq('is_verified', true);
+  const { count: totalFiles } = await supabase.from('files').select('*', { count: 'exact' });
+  const { count: totalPurchases } = await supabase.from('purchases').select('*', { count: 'exact' });
+  const { count: totalReferrals } = await supabase.from('referrals').select('*', { count: 'exact' });
+
+  await bot.sendMessage(chatId,
+    `📊 *STATS*\n─────────────────\n\n` +
+    `👥 Total Users: *${totalUsers || 0}*\n` +
+    `✅ Verified: *${verifiedUsers || 0}*\n` +
+    `📦 Files: *${totalFiles || 0}*\n` +
+    `🛒 Purchases: *${totalPurchases || 0}*\n` +
+    `🔗 Referrals: *${totalReferrals || 0}*`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'admin_panel' }]] }
+    }
+  );
+}
+
+async function handleAdminListFiles(chatId) {
+  const { data: files } = await supabase.from('files').select('*').order('created_at', { ascending: false });
+
+  if (!files || files.length === 0) {
+    return bot.sendMessage(chatId, '📭 No files yet.', {
+      reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'admin_panel' }]] }
+    });
+  }
+
+  const buttons = files.map(f => ([
+    { text: `📦 ${f.name}`, callback_data: 'noop' },
+    { text: '🗑️ Delete', callback_data: `admin_delete_file_${f.id}` }
+  ]));
+  buttons.push([{ text: '⬅️ Back', callback_data: 'admin_panel' }]);
+
+  await bot.sendMessage(chatId, `📋 *ALL FILES*\n─────────────────`, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function handleAdminListChannels(chatId) {
+  const channels = await getChannels();
+
+  if (!channels || channels.length === 0) {
+    return bot.sendMessage(chatId, '📭 No channels yet.', {
+      reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'admin_panel' }]] }
+    });
+  }
+
+  const buttons = channels.map(ch => ([
+    { text: `📢 ${ch.channel_name}`, callback_data: 'noop' },
+    { text: '🗑️ Delete', callback_data: `admin_delete_channel_${ch.id}` }
+  ]));
+  buttons.push([{ text: '⬅️ Back', callback_data: 'admin_panel' }]);
+
+  await bot.sendMessage(chatId, `📋 *REQUIRED CHANNELS*\n─────────────────`, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+const userState = {};
+
+async function processAdminInput(chatId, telegramId, text) {
+  const state = userState[telegramId];
+  if (!state) return false;
+
+  if (state.step === 'add_file_name') {
+    userState[telegramId] = { step: 'add_file_desc', name: text };
+    await bot.sendMessage(chatId, '📝 Enter file *description*:', { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_file_desc') {
+    userState[telegramId] = { ...state, step: 'add_file_content', desc: text };
+    await bot.sendMessage(chatId, '📄 Enter file *content*:', { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_file_content') {
+    userState[telegramId] = { ...state, step: 'add_file_price', content: text };
+    await bot.sendMessage(chatId, '💰 Enter *price in credits*:', { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_file_price') {
+    const price = parseInt(text);
+    if (isNaN(price)) { await bot.sendMessage(chatId, '❌ Enter a number:'); return true; }
+    userState[telegramId] = { ...state, step: 'add_file_refs', price };
+    await bot.sendMessage(chatId, '🔗 Enter *referral price* (or 0):', { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_file_refs') {
+    const priceRefs = parseInt(text) || 0;
+    const { name, desc, content, price } = state;
+    await supabase.from('files').insert({ name, description: desc, content, price_credits: price, price_refs: priceRefs });
+    delete userState[telegramId];
+    await bot.sendMessage(chatId, `✅ File *"${name}"* added!`, { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_channel_id') {
+    userState[telegramId] = { step: 'add_channel_name', channel_id: text };
+    await bot.sendMessage(chatId, '📢 Enter channel *display name*:', { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_channel_name') {
+    userState[telegramId] = { ...state, step: 'add_channel_link', channel_name: text };
+    await bot.sendMessage(chatId, '🔗 Enter channel *invite link*:', { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'add_channel_link') {
+    const { channel_id, channel_name } = state;
+    await supabase.from('required_channels').insert({ channel_id, channel_name, channel_link: text });
+    delete userState[telegramId];
+    await bot.sendMessage(chatId, `✅ Channel *"${channel_name}"* added!`, { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'broadcast_msg') {
+    delete userState[telegramId];
+    const { data: users } = await supabase.from('users').select('telegram_id').eq('is_verified', true);
+    let sent = 0;
+    for (const u of (users || [])) {
+      try {
+        await bot.sendMessage(u.telegram_id, `📡 *BROADCAST*\n\n${text}`, { parse_mode: 'Markdown' });
+        sent++;
+      } catch {}
+    }
+    await bot.sendMessage(chatId, `✅ Sent to *${sent}* users.`, { parse_mode: 'Markdown' });
+    return true;
+  }
+  if (state.step === 'set_ref_credits') {
+    const val = parseInt(text);
+    if (isNaN(val)) { await bot.sendMessage(chatId, '❌ Enter a number:'); return true; }
+    delete userState[telegramId];
+    await supabase.from('settings').update({ value: String(val) }).eq('key', 'referral_credits');
+    await bot.sendMessage(chatId, `✅ Referral credits set to *${val}*!`, { parse_mode: 'Markdown' });
+    return true;
+  }
+  return false;
+}
+
+app.post('/api/webhook', async (req, res) => {
+  res.sendStatus(200);
+  const body = req.body;
+
+  try {
+    if (body.callback_query) {
+      const cb = body.callback_query;
+      const chatId = cb.message.chat.id;
+      const telegramId = cb.from.id;
+      const data = cb.data;
+
+      try { await bot.answerCallbackQuery(cb.id); } catch {}
+
+      const user = await getUser(telegramId);
+
+      if (data === 'verify_now') return handleVerifyNow(cb);
+      if (data === 'main_menu') return sendMainMenu(chatId, user);
+      if (data === 'browse_files') return handleBrowseFiles(chatId);
+      if (data === 'my_referrals') return handleMyReferrals(chatId, telegramId);
+      if (data === 'leaderboard') return handleLeaderboard(chatId);
+      if (data === 'help') return handleHelp(chatId);
+      if (data === 'admin_panel') return handleAdmin(chatId, telegramId);
+      if (data === 'admin_stats') return handleAdminStats(chatId);
+      if (data === 'admin_list_files') return handleAdminListFiles(chatId);
+      if (data === 'admin_list_channels') return handleAdminListChannels(chatId);
+      if (data === 'noop') return;
+
+      if (data === 'my_credits') {
+        const rank = await getRank(user.credits);
+        return bot.sendMessage(chatId,
+          `💰 *YOUR CREDITS*\n─────────────────\n\nCredits: *${user.credits}*\nRank: ${rank}`,
+          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'main_menu' }]] } }
+        );
+      }
+      if (data === 'admin_add_file') {
+        userState[telegramId] = { step: 'add_file_name' };
+        return bot.sendMessage(chatId, '📦 Enter file *name*:', { parse_mode: 'Markdown' });
+      }
+      if (data === 'admin_add_channel') {
+        userState[telegramId] = { step: 'add_channel_id' };
+        return bot.sendMessage(chatId, '📢 Enter channel *username* (e.g. @MyChannel):', { parse_mode: 'Markdown' });
+      }
+      if (data === 'admin_broadcast') {
+        userState[telegramId] = { step: 'broadcast_msg' };
+        return bot.sendMessage(chatId, '📡 Enter *broadcast message*:', { parse_mode: 'Markdown' });
+      }
+      if (data === 'admin_set_ref_credits') {
+        userState[telegramId] = { step: 'set_ref_credits' };
+        return bot.sendMessage(chatId, '⚙️ Enter new *referral credits* amount:', { parse_mode: 'Markdown' });
+      }
+      if (data.startsWith('file_')) return handleViewFile(chatId, telegramId, data.replace('file_', ''));
+      if (data.startsWith('buy_')) return handleBuyFile(chatId, telegramId, data.replace('buy_', ''));
+      if (data.startsWith('admin_delete_file_')) {
+        await supabase.from('files').delete().eq('id', data.replace('admin_delete_file_', ''));
+        return bot.sendMessage(chatId, '🗑️ File deleted!', {
+          reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'admin_list_files' }]] }
+        });
+      }
+      if (data.startsWith('admin_delete_channel_')) {
+        await supabase.from('required_channels').delete().eq('id', data.replace('admin_delete_channel_', ''));
+        return bot.sendMessage(chatId, '🗑️ Channel removed!', {
+          reply_markup: { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'admin_list_channels' }]] }
+        });
+      }
+      return;
+    }
+
+    if (body.message) {
+      const msg = body.message;
+      const chatId = msg.chat.id;
+      const telegramId = msg.from.id;
+      const text = msg.text || '';
+
+      console.log(`Message from ${telegramId}: ${text}`);
+
+      if (text.startsWith('/start')) {
+        const parts = text.split(' ');
+        return handleStart(msg, parts[1] || null);
+      }
+      if (text === '/admin') return handleAdmin(chatId, telegramId);
+
+      const isAdminUser = await isAdmin(telegramId);
+      if (isAdminUser) {
+        const handled = await processAdminInput(chatId, telegramId, text);
+        if (handled) return;
+      }
+
+      const user = await getUser(telegramId);
+      if (user && user.is_verified) return sendMainMenu(chatId, user);
+      else return sendVerification(chatId);
+    }
+
+  } catch (err) {
+    console.error('MAIN ERROR:', err.message, err.stack);
+  }
+});
+
+app.get('/', (req, res) => res.send('Bot is running! ✅'));
+app.get('/api/webhook', (req, res) => res.send('Webhook is active! ✅'));
+
+module.exports = app;
